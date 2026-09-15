@@ -180,8 +180,7 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
         return out.getvalue()
 
     def _get_rotation(self, preview: PreviewSession | None) -> int:
-        """Rotation for this map: the live preview's value while a session is
-        active, otherwise the value stored by the select entity."""
+        """Return the preview session's rotation while active, else the stored one."""
         if preview is not None:
             rotation = preview.rotation
         else:
@@ -206,16 +205,10 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
         rotation: int,
         preview: PreviewSession | None,
     ) -> tuple[float, float] | None:
-        """Top-left of the override in the rotated frame, or None when no override
-        composite is served.
-
-        Preview session -> the session's px (already the rotated-frame top-left).
-        Saved override -> its vacuum anchor, forward-transformed with the CURRENT
-        crop dimensions via map_render.anchor_topleft (so it tracks the crop).
-        """
+        """Rotated-frame top-left of the override, or None when none is served."""
         map_data = map_content.map_data
         dims = getattr(map_data, "image", None) and map_data.image.dimensions
-        if dims is None:
+        if dims is None or map_content.raw_api_response is None:
             return None
 
         if preview is not None:
@@ -266,11 +259,7 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
     async def _async_get_override_bytes(
         self, filename: str, file_hash: str | None
     ) -> bytes | None:
-        """Return the stored background image, cached per (filename, hash).
-
-        Records without a hash (written before hashes existed) are read from
-        disk every time, so a replaced file can never be served stale.
-        """
+        """Return the stored background image, cached per (filename, hash)."""
         if (
             file_hash is not None
             and self._bg_cache is not None
@@ -292,8 +281,7 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
 
     @callback
     def _set_override_render_ok(self, ok: bool) -> None:
-        """Track whether the last override render succeeded, so the published
-        calibration points always describe the image actually served."""
+        """Record whether the last override render succeeded and republish state."""
         if self._override_render_ok is ok:
             return
         self._override_render_ok = ok
@@ -305,13 +293,7 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
         rotation: int,
         preview: PreviewSession | None,
     ) -> bytes | None:
-        """Render the background-override composite, or None for the normal map.
-
-        A live tuning session (options flow open) takes precedence over the
-        persisted override. All session state is snapshotted before the first
-        await so a concurrent websocket update cannot produce a composite
-        mixing old and new parameters.
-        """
+        """Render the background-override composite, or None for the normal map."""
         topleft = self._override_topleft(map_content, rotation, preview)
         if topleft is None:
             return None

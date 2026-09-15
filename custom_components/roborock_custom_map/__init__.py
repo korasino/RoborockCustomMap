@@ -62,12 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Refresh only the maps whose background override actually changed.
-
-    Image entities read entry.options at render time, so a dispatcher nudge is
-    enough — no entry reload, which would tear down entities and any other
-    open tuning session.
-    """
+    """Refresh only the maps whose background override changed."""
     data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     new = _overrides_snapshot(entry)
     old = data.get(DATA_LAST_BG_OVERRIDES) if data is not None else None

@@ -246,12 +246,7 @@ class OptionsFlowHandler(OptionsFlow):
     async def async_step_upload(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Upload (or replace) the custom floor plan, with a live preview.
-
-        Replacing an existing override keeps its tuned placement: the stored
-        anchor/scale are carried over both into the immediate commit and into
-        the preview session.
-        """
+        """Upload or replace the custom floor plan, with a live preview."""
         choice = self._choice
         errors: dict[str, str] = {}
         override = self._current_override()
@@ -480,11 +475,8 @@ class OptionsFlowHandler(OptionsFlow):
     ) -> ConfigFlowResult | None:
         """Persist the floor plan file (if newly uploaded) and its placement.
 
-        offset_x/offset_y are the override's rotated-frame top-left px; they are
-        converted to a crop-invariant vacuum anchor before storing. finish=True
-        ends the flow; finish=False updates the entry in place and returns None
-        so the flow can continue — used to commit an upload before the adjust
-        step, so it survives if the dialog is closed without adjusting.
+        With finish=False the entry is updated in place and None is returned so
+        the flow can continue.
         """
         choice = self._choice
         override = self._current_override()
@@ -567,19 +559,11 @@ class OptionsFlowHandler(OptionsFlow):
         return self.async_create_entry(data=dict(self.config_entry.options))
 
     def _read_uploaded_file(self, file_id: str) -> tuple[bytes, str]:
-        """Read and validate the uploaded file (runs in the executor).
-
-        process_uploaded_file consumes the temp file, so re-submitting the same
-        (already consumed) id raises ValueError; treat that as an invalid image
-        so the user is simply asked to pick the file again. A failed read of
-        the temp file surfaces as a form error instead of crashing the flow.
-        """
+        """Read and validate the uploaded file (runs in the executor)."""
         try:
             with process_uploaded_file(self.hass, file_id) as path:
                 data = path.read_bytes()
-        except ValueError as err:
-            raise map_render.InvalidBackgroundImage("invalid_image") from err
-        except OSError as err:
+        except (ValueError, OSError) as err:
             raise map_render.InvalidBackgroundImage("upload_failed") from err
         return data, map_render.validate_upload(data)
 

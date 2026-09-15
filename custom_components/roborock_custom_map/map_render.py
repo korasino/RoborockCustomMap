@@ -1,12 +1,7 @@
 """Background-override rendering for Roborock maps.
 
-Everything in this module is synchronous and CPU/IO bound — callers must run
-it via hass.async_add_executor_job.
-
-The override composite re-parses the vacuum's raw map bytes with custom
-palettes at the same scale the core roborock integration uses, so the canvas
-dimensions (and therefore the calibration points exposed for the map card)
-are identical to the unmodified render.
+Everything here is synchronous and CPU/IO bound; run it via
+hass.async_add_executor_job.
 """
 
 from __future__ import annotations
@@ -33,7 +28,9 @@ from .const import (
     DOMAIN,
     MAX_BG_DIMENSION,
     MAX_COMPOSITE_DIMENSION,
+    MAX_COMPOSITE_PIXELS,
     MAX_SCALED_DIMENSION,
+    MAX_SCALED_PIXELS,
     MAX_UPLOAD_BYTES,
 )
 
@@ -111,11 +108,7 @@ def _create_parser(
 
 
 def build_overlay(raw: bytes, drawables: list[Drawable], map_scale: int) -> Image.Image:
-    """Parse the raw map into the RGBA layer containing only the drawables.
-
-    Raises ValueError/IndexError when the raw payload cannot be parsed
-    (same failure modes as python-roborock's own MapParser).
-    """
+    """Parse the raw map into an RGBA layer containing only the drawables."""
     overlay_map = _create_parser(_overlay_palette(), drawables, map_scale).parse(raw)
     if overlay_map.image is None:
         raise ValueError("Raw map data could not be rendered")
@@ -123,11 +116,7 @@ def build_overlay(raw: bytes, drawables: list[Drawable], map_scale: int) -> Imag
 
 
 def build_wall_mask(raw: bytes, map_scale: int) -> Image.Image:
-    """Parse the raw map into a single-band alpha mask of walls + charger.
-
-    Only needed while a tuning preview inverts the wall pixels, so callers
-    build it lazily instead of paying a second full parse on every map update.
-    """
+    """Parse the raw map into a single-band alpha mask of walls and charger."""
     mask_map = _create_parser(_mask_palette(), [Drawable.CHARGER], map_scale).parse(raw)
     if mask_map.image is None:
         raise ValueError("Raw map data could not be rendered")
@@ -136,15 +125,19 @@ def build_wall_mask(raw: bytes, map_scale: int) -> Image.Image:
 
 @lru_cache(maxsize=4)
 def _scaled_background(bg_bytes: bytes, scale_x: float, scale_y: float) -> Image.Image:
-    """Decode and scale the background image (cached; treat result read-only).
+    """Decode and scale the background image (cached; treat the result read-only).
 
-    Each axis scale is capped so the scaled edge length never exceeds
-    MAX_SCALED_DIMENSION, protecting against runaway PIL allocations.
+    Scales are reduced so the result never exceeds MAX_SCALED_DIMENSION per axis
+    or MAX_SCALED_PIXELS in total.
     """
-    bg = Image.open(io.BytesIO(bg_bytes))
-    bg = ImageOps.exif_transpose(bg).convert("RGBA")
+    with Image.open(io.BytesIO(bg_bytes)) as src:
+        bg = ImageOps.exif_transpose(src).convert("RGBA")
     scale_x = min(scale_x, MAX_SCALED_DIMENSION / bg.width)
     scale_y = min(scale_y, MAX_SCALED_DIMENSION / bg.height)
+    if (area := bg.width * scale_x * bg.height * scale_y) > MAX_SCALED_PIXELS:
+        shrink = math.sqrt(MAX_SCALED_PIXELS / area)
+        scale_x *= shrink
+        scale_y *= shrink
     if scale_x != 1 or scale_y != 1:
         bg = bg.resize(
             (max(1, round(bg.width * scale_x)), max(1, round(bg.height * scale_y))),
@@ -167,14 +160,7 @@ _ROTATE_TRANSPOSE = {
 
 @dataclass(frozen=True)
 class MapTransform:
-    """Affine map between vacuum-world mm and base (unrotated) render pixels.
-
-    The forward direction delegates to the parser's own ImageDimensions.to_img
-    (the transform MapData.calibration() uses), so override placement can never
-    drift from the calibration points. Only the translation moves as the map's
-    crop box changes, which is why an override anchored in vacuum coordinates
-    survives the base map being re-cropped.
-    """
+    """Affine map between vacuum-world mm and base (unrotated) render pixels."""
 
     dims: ImageDimensions
 
@@ -196,11 +182,7 @@ class MapTransform:
         return (p.x, p.y)
 
     def base_to_vacuum(self, px: float, py: float) -> tuple[float, float]:
-        """Base (unrotated) render pixel -> vacuum-world mm.
-
-        Exact inverse of vacuum_to_base, assuming the Roborock parser's mm/50
-        image transformation.
-        """
+        """Base (unrotated) render pixel -> vacuum-world mm."""
         dims = self.dims
         return (
             (px / dims.scale + dims.left) * 50,
@@ -211,8 +193,7 @@ class MapTransform:
 def rotate_point(
     x: float, y: float, w: int, h: int, rotation: int
 ) -> tuple[float, float]:
-    """Unrotated base pixel (frame w x h) -> rotated frame. CCW, matching the
-    PIL transpose used in compose_final and the plain-map rotation."""
+    """Rotate a base-frame pixel (w x h) counter-clockwise into the rotated frame."""
     if rotation == 90:
         return (y, w - x)
     if rotation == 180:
@@ -238,22 +219,14 @@ def unrotate_point(
 def anchor_topleft(
     transform: MapTransform, anchor_vx: float, anchor_vy: float, rotation: int
 ) -> tuple[float, float]:
-    """Rotated-frame top-left px of an override anchored in vacuum-world mm.
-
-    Single source of the anchor geometry, shared by the image entity's render
-    and calibration and by the options flow's form defaults, so they cannot
-    disagree.
-    """
+    """Rotated-frame top-left px of an override anchored in vacuum-world mm."""
     bx, by = transform.vacuum_to_base(anchor_vx, anchor_vy)
     w_px, h_px = transform.base_size
     return rotate_point(bx, by, w_px, h_px, rotation)
 
 
 def canvas_origin(offset_x: float, offset_y: float) -> tuple[int, int]:
-    """Top-left of the union canvas (<= 0 per axis). Depends only on the override
-    offset, never the background size, so calibration can compute the identical
-    origin without decoding the image. floor() so a fractional-negative offset
-    does not clip the override's top/left edge."""
+    """Top-left of the union canvas (<= 0 per axis), a function of the offset alone."""
     return (math.floor(min(0.0, offset_x)), math.floor(min(0.0, offset_y)))
 
 
@@ -265,22 +238,22 @@ def union_canvas(
     ovr_w: int,
     ovr_h: int,
 ) -> tuple[int, int, int, int]:
-    """Union bbox of the rotated base extent [0, rot] and the override
-    [offset, offset + ovr]. Returns (canvas_w, canvas_h, origin_x, origin_y).
+    """Union bbox of the rotated base extent and the override extent.
 
-    The canvas dimensions are capped at MAX_COMPOSITE_DIMENSION while the
-    origin is preserved, so content may be cropped at the right/bottom but the
-    origin-based calibration shift stays valid for every rendered pixel.
+    Returns (canvas_w, canvas_h, origin_x, origin_y). The size is capped per axis
+    and in total pixels with the origin preserved, so content may be cropped at
+    the right/bottom.
     """
     origin_x, origin_y = canvas_origin(offset_x, offset_y)
     canvas_w = math.ceil(max(rot_w, offset_x + ovr_w)) - origin_x
     canvas_h = math.ceil(max(rot_h, offset_y + ovr_h)) - origin_y
-    return (
-        min(canvas_w, MAX_COMPOSITE_DIMENSION),
-        min(canvas_h, MAX_COMPOSITE_DIMENSION),
-        origin_x,
-        origin_y,
-    )
+    canvas_w = min(canvas_w, MAX_COMPOSITE_DIMENSION)
+    canvas_h = min(canvas_h, MAX_COMPOSITE_DIMENSION)
+    if canvas_w * canvas_h > MAX_COMPOSITE_PIXELS:
+        shrink = math.sqrt(MAX_COMPOSITE_PIXELS / (canvas_w * canvas_h))
+        canvas_w = max(1, math.floor(canvas_w * shrink))
+        canvas_h = max(1, math.floor(canvas_h * shrink))
+    return (canvas_w, canvas_h, origin_x, origin_y)
 
 
 def compose_final(
@@ -295,11 +268,7 @@ def compose_final(
 ) -> bytes:
     """Composite the background under the drawables and encode as PNG.
 
-    offset_x/offset_y are the scaled override's top-left in the ROTATED frame.
-    The canvas is the union bounding box of the rotated base-map extent and the
-    override extent; areas covered by neither are transparent. With a wall mask
-    (adjust preview) the wall/dock pixels invert whatever lies beneath them,
-    which also draws white outlines wherever they fall over transparent areas.
+    offset_x/offset_y are the scaled override's top-left in the rotated frame.
     """
     if rotation in _ROTATE_TRANSPOSE:
         overlay = overlay.transpose(_ROTATE_TRANSPOSE[rotation])
@@ -315,7 +284,9 @@ def compose_final(
     )
 
     canvas = Image.new("RGBA", (canvas_w, canvas_h), _TRANSPARENT)
-    canvas.paste(bg, (round(offset_x - origin_x), round(offset_y - origin_y)), bg)
+    bg_dest = (round(offset_x - origin_x), round(offset_y - origin_y))
+    if bg_dest[0] < canvas_w and bg_dest[1] < canvas_h:
+        canvas.alpha_composite(bg, dest=bg_dest)
 
     base_dest = (-origin_x, -origin_y)
     if base_dest[0] < canvas_w and base_dest[1] < canvas_h:

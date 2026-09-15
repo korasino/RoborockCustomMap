@@ -1,19 +1,8 @@
 """Live preview: session store and websocket command.
 
-While the options flow's upload, tune, or remove step is open, a
-PreviewSession holds the not-yet-saved floor plan bytes and transform
-parameters. The frontend's generic flow preview re-subscribes to
-roborock_custom_map/start_preview (debounced) on every form change; the
-handler updates the session and replies with the map image entity's id +
-access token and a bumped revision, which makes the preview <img> re-fetch
-/api/image_proxy/... — served by RoborockMap.async_image(), which renders the
-session's composite while the session is active.
-
-On the upload step the form's only field is the file picker, so the handler
-reads the just-uploaded temp file by id (without consuming it — the flow's
-submit still needs it) and shows it live; clearing the picker reverts to the
-session's fallback (the default map for a fresh upload, or the current floor
-plan when replacing).
+While an options flow step is open, a PreviewSession holds the unsaved floor
+plan bytes and transform parameters; the websocket handler updates it and bumps
+the revision so the flow's preview image re-fetches.
 """
 
 from __future__ import annotations
@@ -59,12 +48,7 @@ _preview_revision = itertools.count(1)
 class PreviewSession:
     """State of one active preview session (one per options flow).
 
-    offset_x/offset_y are the override's top-left in the rotated (on-screen)
-    frame — the live-adjust px that config_flow converts to a crop-invariant
-    vacuum anchor on submit; the session itself never holds the anchor.
-
-    revision seeds from the process-wide counter so the composite cache key
-    and the preview image URL can never collide with an earlier session.
+    offset_x/offset_y are the override's top-left in the rotated frame.
     """
 
     flow_id: str
@@ -104,11 +88,9 @@ def _session_store(
 def async_set_session(
     hass: HomeAssistant, entry_id: str, session: PreviewSession
 ) -> None:
-    """Register (or replace) the preview session of an options flow.
+    """Register or replace the preview session of an options flow.
 
-    Any other flow's session for the same map is dropped, so the image entity
-    deterministically follows the most recently opened dialog instead of
-    flip-flopping between concurrent flows.
+    Any other flow's session for the same map is dropped.
     """
     if (store := _session_store(hass, entry_id)) is None:
         return
@@ -186,9 +168,7 @@ def _clamp_scale(scale: float) -> float:
 def _read_pending_upload(hass: HomeAssistant, file_id: str) -> bytes | None:
     """Read and validate an uploaded temp file by id without consuming it.
 
-    Runs in the executor. Returns None when the file is missing or would be
-    rejected by the flow's submit validation, so the preview never renders an
-    image that cannot be saved.
+    Runs in the executor. Returns None when the file is missing or invalid.
     """
     store = hass.data.get(FILE_UPLOAD_DOMAIN)
     if store is None or not store.has_file(file_id):
