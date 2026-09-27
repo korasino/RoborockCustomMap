@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 import io
+import json
 import logging
+import os
+from pathlib import Path
+import tempfile
+from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 from roborock.devices.traits.v1.home import HomeTrait
@@ -25,6 +30,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.json import json_bytes
 from homeassistant.util import dt as dt_util
 
 from . import map_render
@@ -60,6 +66,63 @@ def _png_dimensions(data: bytes) -> tuple[int, int] | None:
     if width <= 0 or height <= 0:
         return None
     return (width, height)
+
+
+def _read_map_cache(
+    image_path: Path, metadata_path: Path
+) -> tuple[bytes, dict[str, Any]] | None:
+    """Read one persistent map cache pair."""
+    try:
+        image = image_path.read_bytes()
+        metadata = json.loads(metadata_path.read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        _png_dimensions(image) is None
+        or not isinstance(metadata, dict)
+        or not isinstance(metadata.get("settings"), dict)
+        or not isinstance(metadata.get("attributes"), dict)
+    ):
+        return None
+    return image, metadata
+
+
+def _write_map_cache(
+    image_path: Path,
+    metadata_path: Path,
+    image: bytes,
+    metadata: dict[str, Any],
+    rotation_key: str,
+) -> None:
+    """Replace each file of one map's persistent cache atomically."""
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_tmp_path: Path | None = None
+    metadata_tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=image_path.parent, prefix=f".{image_path.name}.", delete=False
+        ) as image_tmp:
+            image_tmp.write(image)
+            image_tmp_path = Path(image_tmp.name)
+        with tempfile.NamedTemporaryFile(
+            dir=metadata_path.parent, prefix=f".{metadata_path.name}.", delete=False
+        ) as metadata_tmp:
+            metadata_tmp.write(json_bytes(metadata))
+            metadata_tmp_path = Path(metadata_tmp.name)
+
+        assert image_tmp_path is not None
+        assert metadata_tmp_path is not None
+        os.replace(image_tmp_path, image_path)
+        os.replace(metadata_tmp_path, metadata_path)
+    finally:
+        if image_tmp_path is not None:
+            image_tmp_path.unlink(missing_ok=True)
+        if metadata_tmp_path is not None:
+            metadata_tmp_path.unlink(missing_ok=True)
+
+    for stale in image_path.parent.glob(f"{rotation_key}-*.*"):
+        if stale.suffix in {".png", ".json"}:
+            stale.unlink(missing_ok=True)
 
 
 async def async_setup_entry(
@@ -120,6 +183,8 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
         self._bg_cache: tuple[tuple[str, str], bytes] | None = None
         self._composite_cache: tuple[tuple, bytes] | None = None
         self._override_render_ok: bool | None = None
+        self._map_cache_image: bytes | None = None
+        self._map_cache_metadata: dict[str, Any] | None = None
 
         self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
@@ -142,6 +207,12 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
 
         self._attr_image_last_updated = self.coordinator.last_home_update
 
+        image_path, metadata_path = self._map_cache_paths()
+        if cached := await self.hass.async_add_executor_job(
+            _read_map_cache, image_path, metadata_path
+        ):
+            self._map_cache_image, self._map_cache_metadata = cached
+
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,
@@ -163,7 +234,10 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
         if (map_content := self._map_content) is None:
             return
 
-        if self.cached_map != map_content.image_content:
+        if (
+            map_content.image_content is not None
+            and self.cached_map != map_content.image_content
+        ):
             self.cached_map = map_content.image_content
             self._raw_image_size = _png_dimensions(self.cached_map)
             self._attr_image_last_updated = self.coordinator.last_home_update
@@ -236,6 +310,36 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
             for drawable, default_value in DEFAULT_DRAWABLES.items()
             if configured.get(drawable, default_value)
         ]
+
+    def _map_cache_paths(self) -> tuple[Path, Path]:
+        """Return the persistent PNG and JSON cache paths for this map."""
+        directory = map_render.override_dir(self.hass) / "cache"
+        return (
+            directory / f"{self.rotation_key}.png",
+            directory / f"{self.rotation_key}.json",
+        )
+
+    def _map_cache_settings(self) -> dict[str, Any]:
+        """Return saved settings that must match a cached rendered image."""
+        return {
+            "rotation": get_map_rotation(
+                self.hass, self.config_entry.entry_id, self.rotation_key
+            ),
+            "override": self.config_entry.options.get(CONF_BG_OVERRIDES, {}).get(
+                self.rotation_key
+            ),
+        }
+
+    def _cached_map_attributes(self) -> dict[str, Any]:
+        """Return cached attributes when their saved settings still match."""
+        metadata = self._map_cache_metadata
+        if (
+            metadata is not None
+            and metadata.get("settings") == self._map_cache_settings()
+            and isinstance(metadata.get("attributes"), dict)
+        ):
+            return metadata["attributes"]
+        return {}
 
     async def _async_get_overlay(self, raw: bytes) -> Image.Image:
         """Return the parsed drawables overlay, re-parsing when raw changed."""
@@ -361,26 +465,29 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
             self._set_override_render_ok(False)
             return None
 
-    async def async_image(self) -> bytes | None:
-        """Get the image (with optional background override and rotation)."""
-        if (map_content := self._map_content) is None:
-            raise HomeAssistantError("Map flag not found in coordinator maps")
-
-        preview = async_get_session(
-            self.hass, self.config_entry.entry_id, self.rotation_key
-        )
+    async def _async_render_image(
+        self, map_content: MapContent, preview: PreviewSession | None
+    ) -> tuple[bytes, bool]:
+        """Render one map image and return whether it is safe to persist."""
         rotation = self._get_rotation(preview)
 
         composite = await self._async_render_override(map_content, rotation, preview)
         if composite is not None:
-            return composite
+            return composite, True
 
         base = map_content.image_content
+        if base is None:
+            raise HomeAssistantError("Map image content is not available")
+
+        cacheable = preview is None and (
+            self.config_entry.options.get(CONF_BG_OVERRIDES, {}).get(self.rotation_key)
+            is None
+        )
         if rotation == DEFAULT_MAP_ROTATION:
-            return base
+            return base, cacheable
 
         try:
-            return await self.hass.async_add_executor_job(
+            rotated = await self.hass.async_add_executor_job(
                 self._rotate_image, base, rotation
             )
         except (OSError, UnidentifiedImageError) as err:
@@ -388,13 +495,93 @@ class RoborockMap(RoborockCoordinatedEntityV1, ImageEntity):
                 "Failed to rotate Roborock map image: %s, returning original image",
                 err,
             )
-            return base
+            return base, False
+
+        return rotated, cacheable
+
+    async def async_image(self) -> bytes | None:
+        """Get the image (with optional background override and rotation)."""
+        map_content = self._map_content
+        preview = async_get_session(
+            self.hass, self.config_entry.entry_id, self.rotation_key
+        )
+        cache_paths = None if preview is not None else self._map_cache_paths()
+        cache_settings = None if preview is not None else self._map_cache_settings()
+
+        async def _fallback() -> bytes | None:
+            if cache_paths is None or cache_settings is None:
+                return None
+            cached = await self.hass.async_add_executor_job(
+                _read_map_cache, *cache_paths
+            )
+            if cached is None:
+                return None
+            image, metadata = cached
+            if metadata["settings"] != cache_settings:
+                return None
+            self._map_cache_image = image
+            self._map_cache_metadata = metadata
+            return image
+
+        if map_content is None:
+            if cached := await _fallback():
+                return cached
+            raise HomeAssistantError("Map flag not found in coordinator maps")
+
+        try:
+            image, cacheable = await self._async_render_image(map_content, preview)
+        except HomeAssistantError:
+            if cached := await _fallback():
+                return cached
+            raise
+
+        if (
+            cache_paths is not None
+            and cache_settings is not None
+            and cacheable
+            and self._map_content is map_content
+            and cache_settings == self._map_cache_settings()
+        ):
+            metadata = {
+                "settings": cache_settings,
+                "attributes": self.extra_state_attributes or {},
+            }
+            if (
+                self._map_content is map_content
+                and cache_settings == self._map_cache_settings()
+                and (
+                    image != self._map_cache_image
+                    or metadata != self._map_cache_metadata
+                )
+            ):
+                try:
+                    await self.hass.async_add_executor_job(
+                        _write_map_cache,
+                        *cache_paths,
+                        image,
+                        metadata,
+                        self.rotation_key,
+                    )
+                except OSError as err:
+                    _LOGGER.debug(
+                        "Could not persist map cache for %s: %s",
+                        self.rotation_key,
+                        err,
+                    )
+                else:
+                    self._map_cache_image = image
+                    self._map_cache_metadata = metadata
+
+        return image
 
     @property
     def extra_state_attributes(self):
         """Return extra attributes for map card usage (rotation-aware calibration)."""
         if (map_content := self._map_content) is None:
-            raise HomeAssistantError("Map flag not found in coordinator maps")
+            preview = async_get_session(
+                self.hass, self.config_entry.entry_id, self.rotation_key
+            )
+            return self._cached_map_attributes() if preview is None else {}
 
         map_data = map_content.map_data
         if map_data is None:
